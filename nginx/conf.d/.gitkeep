@@ -1,0 +1,2 @@
+# This directory is auto-populated by create_env.sh and cleaned by destroy_env.sh.
+# Each file is named <env_id>.conf and contains an upstream + server block.
