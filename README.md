@@ -99,7 +99,7 @@ devops-sandbox/
 Zero to first running environment in 5 commands:
 
 ```bash
-git clone https://github.com/<you>/devops-sandbox && cd devops-sandbox
+git clone https://github.com/Masterpitan/devops-sandbox && cd devops-sandbox
 cp .env.example .env
 docker compose build
 docker compose up -d
