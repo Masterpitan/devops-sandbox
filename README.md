@@ -26,9 +26,10 @@ A self-service platform for spinning up isolated, short-lived app environments w
 │                                                                 │
 │  ┌──────────────────────────────────────────────────────────┐  │
 │  │  Filesystem                                              │  │
-│  │  envs/<env_id>.json   (state)                           │  │
-│  │  logs/<env_id>/app.log  health.log                      │  │
-│  │  nginx/conf.d/<env_id>.conf  (auto-generated)           │  │
+│  │  envs/<env_id>.json        (state)                       │  │
+│  │  logs/<env_id>/app.log     (container stdout)            │  │
+│  │  logs/<env_id>/health.log  (poll results)                │  │
+│  │  nginx/conf.d/<env_id>.conf  (auto-generated)            │  │
 │  └──────────────────────────────────────────────────────────┘  │
 └─────────────────────────────────────────────────────────────────┘
 ```
@@ -51,26 +52,65 @@ Nginx runs as a Docker container with `extra_hosts: host.docker.internal:host-ga
 
 ---
 
+## Repository Structure
+
+```
+devops-sandbox/
+├── platform/
+│   ├── api.py               # Flask control API
+│   ├── create_env.sh        # Environment lifecycle — create
+│   ├── destroy_env.sh       # Environment lifecycle — destroy
+│   ├── cleanup_daemon.sh    # TTL-based auto-cleanup loop
+│   └── simulate_outage.sh   # Chaos engineering modes
+├── nginx/
+│   ├── nginx.conf           # Main Nginx config
+│   └── conf.d/              # Auto-generated per-env configs
+├── monitor/
+│   └── health_poller.py     # Health check poller
+├── demo-app/
+│   ├── Dockerfile
+│   ├── package.json
+│   └── server.js            # Minimal Express app
+├── logs/                    # Runtime logs (gitignored)
+├── envs/                    # Runtime state files (gitignored)
+├── docker-compose.yml
+├── Dockerfile.api
+├── Makefile
+├── requirements.txt
+├── .env.example
+└── README.md
+```
+
+---
+
 ## Prerequisites
 
 - Docker ≥ 24 + Docker Compose v2
 - Python 3.11+
-- `bash`, `shuf`, `nohup` (standard on Linux)
-- Port 80 and 5000 free on the host
+- `bash`, `shuf`, `nohup` (standard on Linux / WSL2)
+- Ports 80 and 5000 free on the host
+
+> **Windows users:** Run everything inside WSL2. Docker Desktop with the WSL2 backend must be enabled.
 
 ---
 
-## Quick Start (zero → first running env in 5 commands)
+## Quick Start
+
+Zero to first running environment in 5 commands:
 
 ```bash
 git clone https://github.com/<you>/devops-sandbox && cd devops-sandbox
 cp .env.example .env
-make build          # builds sandbox-demo-app + API image
-make up             # starts Nginx, API, health poller, cleanup daemon
-make create         # prompts for name + TTL, prints URL
+docker compose build
+docker compose up -d
+curl -X POST http://localhost:5000/envs -H "Content-Type: application/json" -d '{"name":"myapp","ttl":300}'
 ```
 
-Then visit `http://localhost:<PORT>` or `curl http://localhost:<PORT>/health`.
+Then hit your app:
+```bash
+curl http://localhost:<PORT>/
+curl http://localhost:<PORT>/health
+```
 
 ---
 
@@ -78,56 +118,91 @@ Then visit `http://localhost:<PORT>` or `curl http://localhost:<PORT>/health`.
 
 ### 1. Start the platform
 ```bash
-make up
+docker compose up -d
+docker ps
+# sandbox-nginx, sandbox-api, sandbox-health-poller all running
 ```
 
-### 2. Create an environment
+### 2. Confirm API is live
 ```bash
-make create
-# → name: myapp
-# → TTL: 300
-# [create] ENV_ID=env-myapp-123456
-# [create] URL=http://env-myapp-123456.sandbox.local (or http://localhost:7342)
-# [create] TTL=300s
+curl http://localhost:5000/envs
+# []
 ```
 
-### 3. Check health
+### 3. Create an environment
 ```bash
-make health
-# === Environment Health Status ===
-#   env-myapp-123456 | status=running | ttl_remaining=287s | port=7342
-# === Last Health Check Results ===
-# --- env-myapp-123456 ---
-# 2025-01-01T12:00:30Z status=200 latency=4ms
+curl -X POST http://localhost:5000/envs \
+  -H "Content-Type: application/json" \
+  -d '{"name":"myapp","ttl":300}'
+# {"id":"env-myapp-21319","ttl":300,"url":"http://env-myapp-21319.sandbox.local (or http://localhost:5087)"}
 ```
 
-### 4. Simulate an outage
+### 4. Hit the app directly
 ```bash
-make simulate ENV=env-myapp-123456 MODE=pause
-# [simulate] mode=pause target=env-myapp-123456
-# [simulate] Container paused. Use --mode recover to unpause.
+curl http://localhost:5087/
+# {"message":"Hello from sandbox!","env":"env-myapp-21319","time":"..."}
+
+curl http://localhost:5087/health
+# {"status":"ok","env":"env-myapp-21319","uptime":23.9}
 ```
 
-### 5. Observe degradation (wait ~90s for 3 health failures)
+### 5. Check health poller (after 30s)
 ```bash
-make health
-# env-myapp-123456 | status=degraded | ...
-make logs ENV=env-myapp-123456
+curl http://localhost:5000/envs/env-myapp-21319/health
+# {"results":["2026-05-10T13:55:51Z status=200 latency=33ms", ...]}
+
+curl http://localhost:5000/envs
+# [{"id":"env-myapp-21319","status":"running","ttl_remaining":261,...}]
 ```
 
-### 6. Recover
+### 6. Simulate an outage
 ```bash
-make simulate ENV=env-myapp-123456 MODE=recover
+curl -X POST http://localhost:5000/envs/env-myapp-21319/outage \
+  -H "Content-Type: application/json" \
+  -d '{"mode":"pause"}'
 ```
 
-### 7. Destroy manually (or wait for TTL)
+### 7. Observe degradation (wait ~90s for 3 health failures)
 ```bash
-make destroy ENV=env-myapp-123456
-# Logs archived to logs/archived/env-myapp-123456/
+curl http://localhost:5000/envs
+# "status":"degraded"
+
+curl http://localhost:5000/envs/env-myapp-21319/health
+# status=ERROR entries
 ```
 
-### 8. Auto-destroy
-The cleanup daemon checks every 60s. When `now > created_at + ttl`, it calls `destroy_env.sh` automatically and logs to `logs/cleanup.log`.
+### 8. Recover
+```bash
+curl -X POST http://localhost:5000/envs/env-myapp-21319/outage \
+  -H "Content-Type: application/json" \
+  -d '{"mode":"recover"}'
+
+# wait 30s then:
+curl http://localhost:5000/envs
+# "status":"running"
+```
+
+### 9. View logs
+```bash
+curl http://localhost:5000/envs/env-myapp-21319/logs
+```
+
+### 10. Destroy manually
+```bash
+curl -X DELETE http://localhost:5000/envs/env-myapp-21319
+# logs archived to logs/archived/env-myapp-21319/
+```
+
+### 11. Auto-destroy via TTL
+```bash
+curl -X POST http://localhost:5000/envs \
+  -H "Content-Type: application/json" \
+  -d '{"name":"autoclean","ttl":65}'
+
+# wait 65-125s — cleanup daemon destroys it automatically
+curl http://localhost:5000/envs
+# []
+```
 
 ---
 
@@ -142,12 +217,27 @@ The cleanup daemon checks every 60s. When `now > created_at + ttl`, it calls `de
 | `GET` | `/envs/:id/health` | Last 10 health check results |
 | `POST` | `/envs/:id/outage` | Trigger simulation — body: `{"mode":"crash"}` |
 
+### Outage Modes
+
+| Mode | Effect | Recovery |
+|---|---|---|
+| `crash` | `docker kill` — container stops | `recover` restarts it |
+| `pause` | `docker pause` — container frozen | `recover` unpauses it |
+| `network` | Disconnects container from its network | `recover` reconnects it |
+| `recover` | Restores from crash / pause / network | — |
+| `stress` | Spikes CPU with `stress-ng` for 30s | Auto-recovers |
+
 ```bash
 # Examples
-curl -X POST http://localhost:5000/envs -H 'Content-Type: application/json' -d '{"name":"demo","ttl":600}'
+curl -X POST http://localhost:5000/envs \
+  -H "Content-Type: application/json" -d '{"name":"demo","ttl":600}'
+
 curl http://localhost:5000/envs
+
 curl -X DELETE http://localhost:5000/envs/env-demo-123456
-curl -X POST http://localhost:5000/envs/env-demo-123456/outage -H 'Content-Type: application/json' -d '{"mode":"crash"}'
+
+curl -X POST http://localhost:5000/envs/env-demo-123456/outage \
+  -H "Content-Type: application/json" -d '{"mode":"crash"}'
 ```
 
 ---
@@ -166,6 +256,8 @@ curl -X POST http://localhost:5000/envs/env-demo-123456/outage -H 'Content-Type:
 | `make simulate ENV=… MODE=…` | Run outage simulation |
 | `make clean` | Wipe all state, logs, archives, Nginx configs |
 
+> `make` targets require Linux or WSL2. On Windows use the `curl` API commands directly.
+
 ---
 
 ## Log Shipping
@@ -174,10 +266,32 @@ Uses **Approach A**: `docker logs -f $CONTAINER_ID >> logs/$ENV_ID/app.log &` at
 
 ---
 
+## Environment State File
+
+Each env writes a JSON state file to `envs/<env_id>.json`:
+
+```json
+{
+  "id": "env-myapp-21319",
+  "name": "myapp",
+  "created_at": 1778421319,
+  "ttl": 300,
+  "port": 5087,
+  "network": "env-myapp-21319-net",
+  "log_pid": 51,
+  "status": "running"
+}
+```
+
+State files are written atomically via a temp file + `mv` to prevent partial reads by the cleanup daemon or health poller.
+
+---
+
 ## Known Limitations
 
-- Nginx routing uses `host.docker.internal` — requires Docker ≥ 20.10 with `host-gateway` support (standard on Linux; may need `--add-host` on older versions).
+- Nginx routing uses `host.docker.internal` — requires Docker ≥ 20.10 with `host-gateway` support (standard on Linux; Docker Desktop handles this automatically).
 - `shuf` is used for random port selection — not guaranteed collision-free under very high concurrency (acceptable for a single-VM sandbox).
-- The cleanup daemon runs as a host process (nohup bash); on `make down` it is killed by PID file. If the host reboots, it must be restarted with `make up`.
+- The cleanup daemon runs as a host process (`nohup bash`); on `make down` it is killed by PID file. If the host reboots, it must be restarted with `make up`.
 - `stress` mode requires `stress-ng` inside the app container; the script attempts to install it via `apk` (Alpine only).
 - No TLS — all traffic is plain HTTP, suitable for local/internal use only.
+- Windows users must use WSL2 or call the API directly via `curl` — bash scripts do not run natively on Windows.
